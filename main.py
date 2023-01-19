@@ -24,7 +24,6 @@ logger.info("Starting the bot")
 
 async def main():
     await events.invoke("setup_init")
-    loop = asyncio.get_event_loop()
 
     tasks = set()
 
@@ -32,23 +31,28 @@ async def main():
         logging.warning("None of the bots are enabled. There will be no commands on the baalorbot page.")
 
     if config.twitch.enabled:
-        tasks.add(loop.create_task(server.Twitch_startup()))
+        tasks.add(server.Twitch_startup())
     if config.discord.enabled:
-        tasks.add(loop.create_task(server.Discord_startup()))
+        tasks.add(server.Discord_startup())
 
-    tasks.add(loop.create_task(web._run_app(webpage)))
+    tasks.add(web._run_app(webpage))
 
     try:
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
     except (web.GracefulExit, KeyboardInterrupt):
         pass
     finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
+        logging.debug("Running cleanup...")
         if config.twitch.enabled:
             await server.Twitch_cleanup()
         if config.discord.enabled:
             await server.Discord_cleanup()
-        loop.close()
 
 if __name__ == "__main__":
-    asyncio.run(main()) # TODO: Signal handlers and stuff
+    try:
+        asyncio.run(main()) # TODO: Signal handlers and stuff
+    except (web.GracefulExit, KeyboardInterrupt) as e:
+        if isinstance(e, web.GracefulExit):
+            logging.debug("App closed gracefully")
+        else:
+            logging.debug(f"Received exception {repr(e)}")
