@@ -6,6 +6,7 @@ from typing import Generator, Callable
 
 from collections import defaultdict
 
+import urllib.parse
 import traceback
 import datetime
 import asyncio
@@ -35,16 +36,17 @@ from aiohttp import ClientSession, ContentTypeError
 
 from cache.year_run_stats import get_run_stats
 from cache.mastered import get_current_masteries, get_mastered
-from nameinternal import get, query, Base, Card, Relic
+from nameinternal import get, query, Base, Card, Relic, Potion, Keyword, ScoreBonus
 from sts_profile import get_profile, get_current_profile
 from webpage import router, __botname__, __version__, __github__, __author__
 from wrapper import wrapper
 from twitch import TwitchCommand
 from logger import logger
-from utils import getfile, update_db, get_req_data
+from slice import get_current_run, CurrentRun
+from utils import format_for_slaytabase, getfile, update_db, get_req_data
 from disc import DiscordCommand
 from save import get_savefile, Savefile
-from runs import get_latest_run
+from runs import get_latest_run, get_parser
 
 from typehints import ContextType, CommandType
 import events
@@ -263,6 +265,18 @@ def with_savefile(name: str, *aliases: str, **kwargs):
                 raise ValueError("No savefile")
             return [res]
         return command(name, *aliases, **kwargs)(func, wrapper_func=_savefile_get)
+    return inner
+
+def slice_command(name: str, *aliases: str, **kwargs):
+    def inner(func):
+        async def _slice_get(ctx) -> list:
+            res = get_current_run()
+            if res is None:
+                if ctx:
+                    await ctx.reply("We are not playing Slice & Dice currently.")
+                raise ValueError("No Slice & Dice run going on")
+            return [res]
+        return command(name, *aliases, **kwargs)(func, wrapper_func=_slice_get)
     return inner
 
 class TwitchConn(TBot):
@@ -1017,7 +1031,7 @@ async def giveaway_handle(ctx: ContextType, count: int = 1):
             _ongoing_giveaway["count"] = count
         else:
             _ongoing_giveaway["count"] = 1
-        await ctx.send(f"/announce A giveaway has started! Type {config.baalorbot.prefix}enter to enter!")
+        await ctx.send(f"A giveaway has started! Type {config.baalorbot.prefix}enter to enter!")
 
     elif _ongoing_giveaway["starter"] != ctx.author.name:
         await ctx.reply("Only the person who started the giveaway can resolve it!")
@@ -1049,34 +1063,64 @@ async def giveaway_enter(ctx: ContextType):
 
 @command("info", "cardinfo", "relicinfo")
 async def card_info(ctx: ContextType, *line: str):
-    line = "".join(line)
+    line = " ".join(line)
     info: Base = query(line)
     if info is None:
         await ctx.reply(f"Could not find info for {line!r}")
         return
 
-    mod = ""
-    if info.mod:
-        mod = f"(Mod: {info.mod})"
-    match info.cls_name:
-        case "card":
-            card: Card = info
-            await ctx.reply(f"{card.name} - [{card.cost}] {card.color} {card.rarity} {card.type}: {card.description} {mod}")
-        case "relic":
-            rel: Relic = info
-            pool = " "
-            if rel.pool:
-                pool = f" ({rel.pool})"
-            await ctx.reply(f"{rel.name} - {rel.tier}{pool}: {rel.description} {mod}")
+    await ctx.reply(info.info)
+
+@command("card", "cardart")
+async def card_with_art(ctx: ContextType, *line: str):
+    line = " ".join(line)
+    info: Base = query(line)
+    if info is None:
+        await ctx.reply(f"Could not find card {line!r}")
+        return
+    if info.cls_name != "card":
+        await ctx.reply(f"Can only find art for cards. Use {config.baalorbot.prefix}info instead.")
+        return
+
+    info: Card
+
+    base = "https://raw.githubusercontent.com/OceanUwU/slaytabase/main/docs/"
+    mod = urllib.parse.quote(info.mod or "Slay the Spire").lower()
+    id = format_for_slaytabase(info.internal)
+    link = f"{mod}/cards/{id}.png"
+
+    await ctx.reply(f"You can view this card and the upgrade with the art here: {base}{link}")
 
 @with_savefile("cache", flag="m")
-async def save_cache(ctx: ContextType, save: Savefile, arg: str):
+async def save_cache(ctx: ContextType, save: Savefile, arg: str, *args: str):
+    # TODO: 'cache reload', to reload the JSON, but it needs a bunch of state changing
+    # (need to clear all the commands from both bots first)
     match arg:
         case "clear":
             save._cache.clear()
-            ctx.reply("Cache cleared.")
+            save._cache["self"] = save
+            await ctx.reply("Cache cleared.")
+        case "key" | "find":
+            if arg == "key":
+                val = save._cache
+            else:
+                val = get_parser(args[0])._cache
+            for a in args:
+                try:
+                    val = getattr(val, a)
+                except AttributeError:
+                    try:
+                        a = int(a)
+                    except ValueError:
+                        pass
+                    try:
+                        val = val[a]
+                    except (IndexError, KeyError, TypeError):
+                        break
+
+            await ctx.reply(f"Value in cache: {val}")
         case a:
-            ctx.reply(f"Argument {a!r} not recognized.")
+            await ctx.reply(f"Argument {a!r} not recognized.")
 
 @with_savefile("bluekey", "sapphirekey", "key")
 async def bluekey(ctx: ContextType, save: Savefile):
@@ -1100,6 +1144,10 @@ async def neowbonus(ctx: ContextType, save: Savefile):
     """Display what the Neow bonus was."""
     await ctx.reply(f"Option taken: {save.neow_bonus.picked} {save.neow_bonus.as_str() if save.neow_bonus.has_info else ''}")
 
+@with_savefile("neowskipped", "skippedbonus")
+async def neow_skipped(ctx: ContextType, save: Savefile):
+    await ctx.reply(f"Options skipped: {', '.join(save.neow_bonus.skipped)}")
+
 @with_savefile("seed", "currentseed")
 async def seed_cmd(ctx: ContextType, save: Savefile):
     """Display the run's current seed."""
@@ -1116,8 +1164,9 @@ async def is_seeded(ctx: ContextType, save: Savefile):
 @with_savefile("playtime", "runtime", "time", "played")
 async def run_playtime(ctx: ContextType, save: Savefile):
     """Display the current playtime for the run."""
-    # TODO: get run start time and compare to now, rather than the save data
-    minutes, seconds = divmod(save.playtime, 60)
+    start = save.timestamp - save.timedelta
+    seconds = int(time.time() - start.timestamp())
+    minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     await ctx.reply(f"This run has been going on for {hours}:{minutes:>02}:{seconds:>02}")
 
@@ -1316,6 +1365,19 @@ async def score(ctx: ContextType, save: Savefile):
     else:
         await ctx.reply(f'Current Score: {save.score} points')
 
+@slice_command("curses")
+async def curses(ctx: ContextType, save: CurrentRun):
+    """Display the current run's curses."""
+    await ctx.reply(f"We are running Classic on {save.difficulty} with {'; '.join(save.curses)}.")
+
+@slice_command("items")
+async def items(ctx: ContextType, save: CurrentRun):
+    """Display the current run's unequipped items."""
+    if save.items:
+        await ctx.reply(f"The unequipped items are {'; '.join(save.items)}.")
+    else:
+        await ctx.reply("We have no unequipped items.")
+
 @command("last")
 async def get_last(ctx: ContextType, arg1: str = "", arg2: str = ""):
     """Get the last run/win/loss."""
@@ -1486,25 +1548,13 @@ async def mastered_stuff(ctx: ContextType, *card: str):
         await ctx.reply(f"The {info.cls_name} {info.name} is NOT mastered.")
 
 @with_savefile("candidates")
-async def current_mastery_check(ctx: ContextType, save: Savefile, *arg: str):
-    """Output what cards and relics in the current run can be mastered if won."""
-    mastery_type = "".join(arg)
-    if mastery_type != "cards" and mastery_type != "relics":
-        await ctx.reply(f'Call {config.baalorbot.prefix}candidates with "cards" or "relics".')
-
+async def current_mastery_check(ctx: ContextType, save: Savefile):
+    """Output what cards in the current run can be mastered if won."""
     one_ofs, cards_can_master, relics_can_master = get_current_masteries(save)
-
-    match mastery_type:
-        case "cards":
-            if cards_can_master:
-                await ctx.reply(f"The cards that can be mastered this run are: {', '.join(cards_can_master)}")
-            else:
-                await ctx.reply(f"There are no new cards in this run that can be mastered.")
-        case "relics":
-            if relics_can_master:
-                await ctx.reply(f"The relics that can be mastered this run are: {', '.join(relics_can_master)}")
-            else:
-                await ctx.reply(f"There are no new relics in this run that can be mastered.")
+    if cards_can_master:
+        await ctx.reply(f"The cards that can be mastered this run are: {', '.join(cards_can_master)}")
+    else:
+        await ctx.reply(f"There are no new cards in this run that can be mastered.")
 
 @router.get("/commands")
 @template("commands.jinja2")

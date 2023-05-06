@@ -16,6 +16,7 @@ from response_objects.profiles import ProfilesResponse
 from cache.year_run_stats import update_run_stats
 from cache.cache_helpers import RunLinkedListNode
 from cache.mastered import update_mastery_stats
+from nameinternal import get, Potion
 from sts_profile import get_profile
 from gamedata import FileParser, KeysObtained
 from webpage import router
@@ -116,6 +117,39 @@ class RunParser(FileParser):
     @property
     def final_health(self) -> tuple[int, int]:
         return self._data["current_hp_per_floor"][-1], self._data["max_hp_per_floor"][-1]
+
+    def _potion_handling(self, key: str) -> list[list[Potion]]:
+        final = [[]] # empty list for Neow
+        # this needs RHP, so it might not be present
+        # but we want a list anyway, which is why we iterate like this
+        for i in range(self.floor_reached):
+            potions = []
+            try:
+                for x in self._data[key][i]:
+                    potions.append(get(x))
+            except (KeyError, IndexError):
+                # Either we don't have RHP, or the floor isn't stored somehow
+                pass
+
+            final.append(potions)
+
+        return final
+
+    @property
+    def potions_use(self) -> list[list[Potion]]:
+        return self._potion_handling("potion_use_per_floor")
+
+    @property
+    def potions_alchemize(self) -> list[list[Potion]]:
+        return self._potion_handling("potions_obtained_alchemize")
+
+    @property
+    def potions_entropic(self) -> list[list[Potion]]:
+        return self._potion_handling("potions_obtained_entropic_brew")
+
+    @property
+    def potions_discarded(self) -> list[list[Potion]]:
+        return self._potion_handling("potion_discard_per_floor")
 
     @property
     def score(self) -> int:
@@ -277,7 +311,7 @@ async def pick_profile(req: Request):
 
     return convert_class_to_obj(ProfilesResponse(profiles))
 
-def _get_parser(name) -> RunParser | None:
+def get_parser(name) -> RunParser | None:
     parser = _cache.get(f"{name}.run") # most common case
     if parser is None:
         _update_cache()
@@ -303,7 +337,7 @@ def _falsey(x: str | None) -> bool:
 @router.get("/runs/{name}")
 @aiohttp_jinja2.template("run_single.jinja2")
 async def run_single(req: Request):
-    parser = _get_parser(req.match_info["name"])
+    parser = get_parser(req.match_info["name"])
     if parser is None:
         raise HTTPNotFound()
     redirect = _truthy(req.query.get("redirect"))
@@ -313,7 +347,7 @@ async def run_single(req: Request):
 
 @router.get("/runs/{name}/raw")
 async def run_raw_json(req: Request) -> Response:
-    parser = _get_parser(req.match_info["name"])
+    parser = get_parser(req.match_info["name"])
     if parser is None:
         raise HTTPNotFound()
 
@@ -321,7 +355,7 @@ async def run_raw_json(req: Request) -> Response:
 
 @router.get("/runs/{name}/{type}")
 async def run_chart(req: Request) -> Response:
-    parser = _get_parser(req.match_info["name"])
+    parser = get_parser(req.match_info["name"])
     if parser is None:
         raise HTTPNotFound()
 
